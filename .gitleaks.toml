@@ -1,0 +1,8 @@
+# Gitleaks configuration: extend the default rule set unchanged.
+# Add narrow allowlist entries here only for proven false positives,
+# each with a comment naming the file and why it is safe.
+# Never allowlist a real credential pattern globally.
+title = "modelview gitleaks"
+
+[extend]
+useDefault = true

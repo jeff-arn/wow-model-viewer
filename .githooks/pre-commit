@@ -1,0 +1,32 @@
+#!/bin/sh
+# Pre-commit gates for modelview: format, lints, tests, secret scan.
+# Installed via scripts/setup.sh (sets core.hooksPath to .githooks).
+# Bypass only with an explicit reason: git commit --no-verify (say why).
+set -u
+
+fail() {
+    echo "pre-commit: $1" >&2
+    echo "pre-commit: commit aborted. Fix the failure, or bypass with --no-verify and explain why." >&2
+    exit 1
+}
+
+command -v cargo >/dev/null 2>&1 || fail "cargo not found on PATH (expected ~/.cargo/bin)"
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --check || fail "formatting differs; run 'cargo fmt' and re-stage"
+
+echo "pre-commit: cargo clippy -D warnings"
+cargo clippy --release --all-targets -- -D warnings || fail "clippy reported warnings"
+
+echo "pre-commit: cargo test"
+cargo test --release || fail "tests failed"
+
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks (staged changes)"
+    gitleaks protect --staged --redact || fail "gitleaks found a possible secret in staged changes"
+else
+    fail "gitleaks not found (expected ~/.local/bin/gitleaks); run scripts/setup.sh"
+fi
+
+echo "pre-commit: all checks passed"
+exit 0

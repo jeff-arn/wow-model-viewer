@@ -1,0 +1,17 @@
+[package]
+name = "modelview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = "1.25.2"
+eframe = { version = "0.37.0", features = ["wgpu"] }
+glam = "0.34.1"
+image = "0.25.10"
+pollster = "1.0.1"
+thiserror = "2.0.21"
+wgpu = "30.0.1"
+wow-blp = "0.7.0"
+wow-m2 = "0.7.0"
+wow-mpq = "0.7.0"
