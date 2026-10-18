@@ -10,6 +10,9 @@ pub struct DataDir {
     pub root: PathBuf,
     patch_chain: PatchChain,
     pub archive_paths: Vec<PathBuf>,
+    /// Lazily opened individual archives (parallel to `archive_paths`),
+    /// only used to fall back past unusable shadowing copies.
+    fallback_archives: Vec<Option<wow_mpq::Archive>>,
 }
 
 /// Numeric suffix of a patch archive: `patch.MPQ` -> 0, `patch-5.MPQ` -> 5.
@@ -83,10 +86,14 @@ impl DataDir {
                 .with_context(|| format!("opening {}", archive_path.display()))?;
             archive_paths.push(archive_path.clone());
         }
+        let mut fallback_archives: Vec<Option<wow_mpq::Archive>> =
+            Vec::with_capacity(archive_paths.len());
+        fallback_archives.resize_with(archive_paths.len(), || None);
         Ok(Self {
             root: data_directory.to_path_buf(),
             patch_chain,
             archive_paths,
+            fallback_archives,
         })
     }
 
@@ -96,6 +103,56 @@ impl DataDir {
         self.patch_chain
             .read_file(internal_path)
             .with_context(|| format!("reading {internal_path}"))
+    }
+
+    /// Every distinct copy of a file across the chain, best copy first.
+    /// The first entry is the patch-chain winner; later entries come from
+    /// individual archives in descending priority. This exists because real
+    /// patch archives contain tombstones — e.g. `patch.MPQ` ships a 0-byte
+    /// `Creature\OgreWarlord\OgreWarlord.m2` that shadows the healthy copy
+    /// in `model.MPQ`. Callers that can judge usability (parsers, decoders)
+    /// walk this list until one copy works.
+    /// Returns (source archive file name, bytes) pairs, deduplicated by content.
+    pub fn read_copies(&mut self, internal_path: &str) -> Vec<(String, Vec<u8>)> {
+        let mut copies: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Ok(winning_bytes) = self.patch_chain.read_file(internal_path) {
+            let winning_archive = self
+                .patch_chain
+                .find_file_archive(internal_path)
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "patch chain".to_string());
+            copies.push((winning_archive, winning_bytes));
+        }
+        // Individual archives, highest priority (last loaded) first.
+        for archive_index in (0..self.archive_paths.len()).rev() {
+            if self.fallback_archives[archive_index].is_none() {
+                match wow_mpq::Archive::open(&self.archive_paths[archive_index]) {
+                    Ok(opened_archive) => {
+                        self.fallback_archives[archive_index] = Some(opened_archive)
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let Some(archive) = self.fallback_archives[archive_index].as_mut() else {
+                continue;
+            };
+            let Ok(candidate_bytes) = archive.read_file(internal_path) else {
+                continue;
+            };
+            if copies
+                .iter()
+                .any(|(_, existing_bytes)| *existing_bytes == candidate_bytes)
+            {
+                continue;
+            }
+            let archive_name = self.archive_paths[archive_index]
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "archive".to_string());
+            copies.push((archive_name, candidate_bytes));
+        }
+        copies
     }
 
     pub fn contains_file(&self, internal_path: &str) -> bool {

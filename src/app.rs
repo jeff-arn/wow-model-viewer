@@ -22,12 +22,57 @@ pub type DecodedTextures = HashMap<String, DecodedTexture>;
 /// A parsed model plus its decoded textures and non-fatal load warnings.
 pub type LoadedModel = (RenderModel, DecodedTextures, Vec<String>);
 
+/// Pick the first copy a validator accepts. Returns the copy's source
+/// label, its bytes, and how many copies were skipped before it.
+pub fn first_usable_copy(
+    copies: &[(String, Vec<u8>)],
+    mut is_usable: impl FnMut(&[u8]) -> bool,
+) -> Option<(&str, &[u8], usize)> {
+    for (copy_index, (source_label, copy_bytes)) in copies.iter().enumerate() {
+        if is_usable(copy_bytes) {
+            return Some((source_label.as_str(), copy_bytes.as_slice(), copy_index));
+        }
+    }
+    None
+}
+
 /// Load one model and every texture its batches reference, through the
 /// patch chain. Missing/undecodable textures become warnings (the renderer
 /// substitutes a magenta placeholder), never load failures.
 pub fn load_model(data_directory: &mut DataDir, internal_model_path: &str) -> Result<LoadedModel> {
-    let model_bytes = data_directory.read_file(internal_model_path)?;
-    let model = crate::model::parse_m2(&model_bytes, internal_model_path)?;
+    // Patch archives can shadow a healthy model with a 0-byte tombstone
+    // (patch.MPQ does this to OgreWarlord); walk every copy until one parses.
+    let model_copies = data_directory.read_copies(internal_model_path);
+    if model_copies.is_empty() {
+        anyhow::bail!("reading {internal_model_path}: file not found in any archive");
+    }
+    let mut model = None;
+    let mut skipped_copies = 0usize;
+    let mut first_parse_error = String::new();
+    for (source_label, copy_bytes) in &model_copies {
+        match crate::model::parse_m2(copy_bytes, internal_model_path) {
+            Ok(parsed_model) => {
+                if skipped_copies > 0 {
+                    eprintln!(
+                        "note: {internal_model_path}: skipped {skipped_copies} unusable copy/copies, using {source_label}"
+                    );
+                }
+                model = Some(parsed_model);
+                break;
+            }
+            Err(parse_error) => {
+                if skipped_copies == 0 {
+                    first_parse_error = format!("{parse_error:#}");
+                }
+                skipped_copies += 1;
+            }
+        }
+    }
+    let model = model.with_context(|| {
+        format!(
+            "parsing {internal_model_path} (no usable copy in any archive: {first_parse_error})"
+        )
+    })?;
     let (textures, warnings) = load_model_textures(data_directory, &model);
     Ok((model, textures, warnings))
 }
@@ -70,10 +115,21 @@ fn load_one_texture(
     texture_path: &str,
     archive_file_list: &mut Option<Vec<String>>,
 ) -> std::result::Result<(String, DecodedTexture), String> {
-    if let Ok(blp_bytes) = data_directory.read_file(texture_path) {
-        let decoded = decode_blp_rgba(&blp_bytes)
+    // Walk every copy of the texture: a shadowing copy can be a 0-byte
+    // tombstone just like models (see load_model), so decode-test each one.
+    let texture_copies = data_directory.read_copies(texture_path);
+    let usable_copy = first_usable_copy(&texture_copies, |copy_bytes| {
+        decode_blp_rgba(copy_bytes).is_ok()
+    });
+    if let Some((_, usable_bytes, _)) = usable_copy {
+        let decoded = decode_blp_rgba(usable_bytes)
             .map_err(|error| format!("texture {texture_path}: {error:#}"))?;
         return Ok((texture_path.to_string(), decoded));
+    }
+    if !texture_copies.is_empty() {
+        return Err(format!(
+            "texture {texture_path}: no decodable copy in any archive"
+        ));
     }
     if archive_file_list.is_none() {
         *archive_file_list = data_directory.list_all_files().ok();
@@ -82,10 +138,14 @@ fn load_one_texture(
         .as_ref()
         .and_then(|file_names| find_skin_fallback(file_names, texture_path))
         .ok_or_else(|| format!("texture not found: {texture_path}"))?;
-    let blp_bytes = data_directory
-        .read_file(&fallback_path)
-        .map_err(|_| format!("texture not found: {texture_path}"))?;
-    let decoded = decode_blp_rgba(&blp_bytes)
+    // The fallback skin can itself be shadowed by a tombstone copy,
+    // so walk its copies too (OgreWarlord's skins are 0-byte in patch.MPQ).
+    let fallback_copies = data_directory.read_copies(&fallback_path);
+    let usable_fallback = first_usable_copy(&fallback_copies, |copy_bytes| {
+        decode_blp_rgba(copy_bytes).is_ok()
+    })
+    .ok_or_else(|| format!("texture not found: {texture_path}"))?;
+    let decoded = decode_blp_rgba(usable_fallback.1)
         .map_err(|error| format!("texture {texture_path}: {error:#}"))?;
     Ok((fallback_path, decoded))
 }
@@ -345,6 +405,26 @@ mod tests {
             "Creature\\Other\\RagnarosSkin.blp".to_string(),
             "Creature\\Ragnaros\\Ragnaros.txt".to_string(),
         ]
+    }
+
+    #[test]
+    fn first_usable_copy_skips_tombstones() {
+        let copies = vec![
+            ("patch.MPQ".to_string(), Vec::new()),
+            ("model.MPQ".to_string(), b"MD20-good".to_vec()),
+        ];
+        let (source, bytes, skipped) =
+            first_usable_copy(&copies, |copy| copy.starts_with(b"MD20")).expect("usable copy");
+        assert_eq!(source, "model.MPQ");
+        assert_eq!(bytes, b"MD20-good");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn first_usable_copy_returns_none_when_all_unusable() {
+        let copies = vec![("patch.MPQ".to_string(), Vec::new())];
+        assert!(first_usable_copy(&copies, |copy| !copy.is_empty()).is_none());
+        assert!(first_usable_copy(&[], |_| true).is_none());
     }
 
     #[test]

@@ -72,6 +72,12 @@ Run the viewer:
   (missing foliage; GPU out-of-memory). See git history / README.
 - Models with no geometry (camera-only `.m2`) and non-256 versions must
   return errors, never panic. Baseline: 9,674 of 10,193 local `.m2` files parse.
+- **Patch tombstones are real.** `patch.MPQ` ships 0-byte copies (e.g.
+  `Creature\OgreWarlord\OgreWarlord.m2` and its skins) that shadow healthy
+  files in `model.MPQ`/`texture.MPQ`. `DataDir::read_copies` returns every
+  distinct copy best-first; model loading and texture decoding must walk
+  copies until one parses/decodes (`first_usable_copy`). Never assume the
+  chain winner is usable.
 
 ## Standards
 

@@ -70,3 +70,28 @@ fn corrupt_inputs_error_without_panic() {
     assert!(modelview::model::parse_m2(&bad, "x.m2").is_err());
     assert!(modelview::app::decode_blp_rgba(b"not a blp").is_err());
 }
+
+#[test]
+fn ogre_warlord_loads_past_patch_tombstone() {
+    let Some(dir) = data_dir() else {
+        eprintln!("skipping: no WoW Data dir (set WOW_DATA_DIR)");
+        return;
+    };
+    let mut data = DataDir::open(&dir).expect("open Data dir");
+    // patch.MPQ shadows this model with a 0-byte copy; model.MPQ holds the real one.
+    let copies = data.read_copies("Creature\\OgreWarlord\\OgreWarlord.m2");
+    assert!(
+        copies.len() >= 2,
+        "expected tombstone + real copy, got {}",
+        copies.len()
+    );
+    assert!(
+        copies[0].1.is_empty(),
+        "winning copy should be the 0-byte tombstone"
+    );
+    let (model, _textures, _warnings) =
+        modelview::app::load_model(&mut data, "Creature\\OgreWarlord\\OgreWarlord.m2")
+            .expect("OgreWarlord loads past the tombstone");
+    assert!(!model.batches.is_empty());
+    assert_eq!(model.name, "OgreWarlord");
+}
