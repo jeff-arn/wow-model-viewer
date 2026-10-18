@@ -3,94 +3,139 @@ use crate::mpq::DataDir;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-pub fn decode_blp_rgba(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    let img = wow_blp::parser::load_blp_from_buf(data).context("parsing BLP")?;
-    let dyn_img = wow_blp::convert::blp_to_image(&img, 0).context("decoding BLP")?;
-    let rgba = dyn_img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Ok((rgba.into_raw(), w, h))
+/// Decode a BLP2 texture to RGBA8. Returns (pixels, width, height).
+/// Only the base mip level is decoded (see README design choices).
+pub fn decode_blp_rgba(blp_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    let blp_image = wow_blp::parser::load_blp_from_buf(blp_bytes).context("parsing BLP")?;
+    let decoded_image = wow_blp::convert::blp_to_image(&blp_image, 0).context("decoding BLP")?;
+    let rgba_image = decoded_image.to_rgba8();
+    let (width, height) = rgba_image.dimensions();
+    Ok((rgba_image.into_raw(), width, height))
 }
 
-/// CPU-decoded textures keyed by internal BLP path: (RGBA8 pixels, width, height).
-pub type DecodedTextures = HashMap<String, (Vec<u8>, u32, u32)>;
+/// One CPU-decoded texture: (RGBA8 pixels, width, height).
+pub type DecodedTexture = (Vec<u8>, u32, u32);
+
+/// CPU-decoded textures keyed by internal BLP path.
+pub type DecodedTextures = HashMap<String, DecodedTexture>;
 
 /// A parsed model plus its decoded textures and non-fatal load warnings.
 pub type LoadedModel = (RenderModel, DecodedTextures, Vec<String>);
 
-pub fn load_model(data: &mut DataDir, internal: &str) -> Result<LoadedModel> {
-    let bytes = data.read_file(internal)?;
-    let model = crate::model::parse_m2(&bytes, internal)?;
-    let mut textures = HashMap::new();
-    let mut warnings = Vec::new();
-    let mut wanted: Vec<String> = model
-        .batches
-        .iter()
-        .filter_map(|b| b.texture.clone())
-        .collect();
-    wanted.sort();
-    wanted.dedup();
-    let mut all_names: Option<Vec<String>> = None;
-    for tex in wanted {
-        match data.read_file(&tex) {
-            Ok(raw) => match decode_blp_rgba(&raw) {
-                Ok(decoded) => {
-                    textures.insert(tex, decoded);
-                }
-                Err(e) => warnings.push(format!("texture {tex}: {e:#}")),
-            },
-            Err(_) => {
-                // Creature skins use variant names (e.g. RagnarosSkin.blp), not the
-                // derived Name1.blp guess. Fall back to a same-directory skin file.
-                if all_names.is_none() {
-                    all_names = data.list_all().ok();
-                }
-                let fallback = all_names
-                    .as_ref()
-                    .and_then(|names| find_skin_fallback(names, &tex));
-                match fallback.and_then(|f| data.read_file(&f).ok().map(|r| (f, r))) {
-                    Some((found, raw)) => match decode_blp_rgba(&raw) {
-                        Ok(decoded) => {
-                            warnings.push(format!("texture {tex} -> using {found}"));
-                            textures.insert(tex, decoded);
-                        }
-                        Err(e) => warnings.push(format!("texture {tex}: {e:#}")),
-                    },
-                    None => warnings.push(format!("texture not found: {tex}")),
-                }
-            }
-        }
-    }
+/// Load one model and every texture its batches reference, through the
+/// patch chain. Missing/undecodable textures become warnings (the renderer
+/// substitutes a magenta placeholder), never load failures.
+pub fn load_model(data_directory: &mut DataDir, internal_model_path: &str) -> Result<LoadedModel> {
+    let model_bytes = data_directory.read_file(internal_model_path)?;
+    let model = crate::model::parse_m2(&model_bytes, internal_model_path)?;
+    let (textures, warnings) = load_model_textures(data_directory, &model);
     Ok((model, textures, warnings))
 }
 
-fn find_skin_fallback(names: &[String], wanted: &str) -> Option<String> {
-    let (dir, file) = wanted.rsplit_once('\\')?;
-    let stem = file
+fn load_model_textures(
+    data_directory: &mut DataDir,
+    model: &RenderModel,
+) -> (DecodedTextures, Vec<String>) {
+    let mut decoded_textures = HashMap::new();
+    let mut warnings = Vec::new();
+    let mut wanted_texture_paths: Vec<String> = model
+        .batches
+        .iter()
+        .filter_map(|batch| batch.texture_path.clone())
+        .collect();
+    wanted_texture_paths.sort();
+    wanted_texture_paths.dedup();
+
+    // Lazily fetched archive listing, only needed for skin-variant fallback.
+    let mut archive_file_list: Option<Vec<String>> = None;
+    for texture_path in wanted_texture_paths {
+        match load_one_texture(data_directory, &texture_path, &mut archive_file_list) {
+            Ok((resolved_path, decoded)) => {
+                if resolved_path != texture_path {
+                    warnings.push(format!("texture {texture_path} -> using {resolved_path}"));
+                }
+                decoded_textures.insert(texture_path, decoded);
+            }
+            Err(warning) => warnings.push(warning),
+        }
+    }
+    (decoded_textures, warnings)
+}
+
+/// Load and decode one texture, falling back to a same-directory skin
+/// variant (e.g. `RagnarosSkin.blp`) when the derived name is absent.
+/// The `Err` value is a human-readable warning, not a fatal error.
+fn load_one_texture(
+    data_directory: &mut DataDir,
+    texture_path: &str,
+    archive_file_list: &mut Option<Vec<String>>,
+) -> std::result::Result<(String, DecodedTexture), String> {
+    if let Ok(blp_bytes) = data_directory.read_file(texture_path) {
+        let decoded = decode_blp_rgba(&blp_bytes)
+            .map_err(|error| format!("texture {texture_path}: {error:#}"))?;
+        return Ok((texture_path.to_string(), decoded));
+    }
+    if archive_file_list.is_none() {
+        *archive_file_list = data_directory.list_all_files().ok();
+    }
+    let fallback_path = archive_file_list
+        .as_ref()
+        .and_then(|file_names| find_skin_fallback(file_names, texture_path))
+        .ok_or_else(|| format!("texture not found: {texture_path}"))?;
+    let blp_bytes = data_directory
+        .read_file(&fallback_path)
+        .map_err(|_| format!("texture not found: {texture_path}"))?;
+    let decoded = decode_blp_rgba(&blp_bytes)
+        .map_err(|error| format!("texture {texture_path}: {error:#}"))?;
+    Ok((fallback_path, decoded))
+}
+
+/// Preference score for skin-variant candidates: light skins first,
+/// then anything with "skin" in the name.
+fn skin_candidate_score(file_name: &str) -> i32 {
+    let lowercased_name = file_name.to_ascii_lowercase();
+    let mut score = 0;
+    if lowercased_name.contains("light") {
+        score += 4;
+    }
+    if lowercased_name.contains("skin") {
+        score += 2;
+    }
+    score
+}
+
+/// Find the best same-directory `.blp` whose name starts with the wanted
+/// texture's base name (numeric suffix stripped), e.g. wanting
+/// `Creature\Ragnaros\Ragnaros1.blp` finds `Creature\Ragnaros\RagnarosSkin.blp`.
+pub fn find_skin_fallback(
+    archive_file_names: &[String],
+    wanted_texture_path: &str,
+) -> Option<String> {
+    let (wanted_directory, wanted_file_name) = wanted_texture_path.rsplit_once('\\')?;
+    let wanted_stem = wanted_file_name
         .to_ascii_lowercase()
         .trim_end_matches(".blp")
         .to_string();
-    let base = stem.trim_end_matches(|c: char| c.is_ascii_digit());
-    let mut candidates: Vec<&String> = names
+    let wanted_base_name = wanted_stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    let mut candidates: Vec<&String> = archive_file_names
         .iter()
-        .filter(|n| {
-            let Some((d, f)) = n.rsplit_once('\\') else {
+        .filter(|candidate_path| {
+            let Some((candidate_directory, candidate_file_name)) = candidate_path.rsplit_once('\\')
+            else {
                 return false;
             };
-            d.eq_ignore_ascii_case(dir)
-                && f.to_ascii_lowercase()
-                    .starts_with(&base.to_ascii_lowercase())
-                && f.to_ascii_lowercase().ends_with(".blp")
+            candidate_directory.eq_ignore_ascii_case(wanted_directory)
+                && candidate_file_name
+                    .to_ascii_lowercase()
+                    .starts_with(wanted_base_name)
+                && candidate_file_name.to_ascii_lowercase().ends_with(".blp")
         })
         .collect();
-    candidates.sort_by_key(|f| {
-        let lower = f.to_ascii_lowercase();
-        let score = (if lower.contains("light") { 4 } else { 0 })
-            + (if lower.contains("skin") { 2 } else { 0 });
-        std::cmp::Reverse(score)
-    });
-    candidates.first().map(|c| c.to_string())
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(skin_candidate_score(candidate)));
+    candidates.first().map(|candidate| candidate.to_string())
 }
 
+/// Headless `wgpu` renderer for CLI screenshots (no window or display).
 pub struct Headless {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -99,9 +144,9 @@ pub struct Headless {
 
 impl Headless {
     pub fn new() -> Result<Self> {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        let instance = wgpu::Instance::new(desc);
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(instance_descriptor);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
@@ -133,118 +178,213 @@ impl Headless {
         textures: &DecodedTextures,
         width: u32,
         height: u32,
-        yaw: f32,
-        pitch: f32,
-        out: &std::path::Path,
+        camera_yaw: f32,
+        camera_pitch: f32,
+        output_path: &std::path::Path,
     ) -> Result<()> {
-        let mut views = HashMap::new();
-        for (name, (rgba, w, h)) in textures {
-            views.insert(
-                name.clone(),
-                self.renderer
-                    .upload_texture(&self.device, &self.queue, rgba, *w, *h),
+        let mut texture_views = HashMap::new();
+        for (texture_path, (rgba_pixels, texture_width, texture_height)) in textures {
+            texture_views.insert(
+                texture_path.clone(),
+                self.renderer.upload_texture(
+                    &self.device,
+                    &self.queue,
+                    rgba_pixels,
+                    *texture_width,
+                    *texture_height,
+                ),
             );
         }
-        let gpu = self
-            .renderer
-            .upload(&self.device, &self.queue, model, &views);
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let color_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shot"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let depth_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let camera = crate::render::Camera::new(gpu.center, gpu.radius, yaw, pitch);
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.renderer.draw(
+        let gpu_model =
+            self.renderer
+                .upload_model(&self.device, &self.queue, model, &texture_views);
+        let color_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let color_texture = create_render_target(
+            &self.device,
+            "screenshot-color",
+            width,
+            height,
+            color_format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth_texture = create_render_target(
+            &self.device,
+            "screenshot-depth",
+            width,
+            height,
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let camera = crate::render::Camera::new(
+            gpu_model.bounding_center,
+            gpu_model.bounding_radius,
+            camera_yaw,
+            camera_pitch,
+        );
+        let mut command_encoder = self.device.create_command_encoder(&Default::default());
+        self.renderer.draw_model(
             &self.device,
             &self.queue,
-            &mut encoder,
-            &color_tex.create_view(&Default::default()),
-            &depth_tex.create_view(&Default::default()),
-            format,
-            &gpu,
+            &mut command_encoder,
+            &color_texture.create_view(&Default::default()),
+            &depth_texture.create_view(&Default::default()),
+            color_format,
+            &gpu_model,
             &camera,
             width,
             height,
         );
-        let padded_row = (width * 4).next_multiple_of(256);
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded_row * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &color_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_secs(30)),
-            })
-            .context("polling GPU")?;
-        rx.recv()
-            .context("map callback")?
-            .context("mapping readback")?;
-        let data = slice.get_mapped_range().context("reading pixels")?;
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for row in 0..height {
-            let start = (row * padded_row) as usize;
-            pixels.extend_from_slice(&data[start..start + (width * 4) as usize]);
-        }
-        drop(data);
-        buf.unmap();
-        let img = image::RgbaImage::from_raw(width, height, pixels).context("assembling image")?;
-        img.save(out)
-            .with_context(|| format!("writing {}", out.display()))?;
+        let pixels = read_back_pixels(self, command_encoder, &color_texture, width, height)?;
+        let screenshot_image =
+            image::RgbaImage::from_raw(width, height, pixels).context("assembling image")?;
+        screenshot_image
+            .save(output_path)
+            .with_context(|| format!("writing {}", output_path.display()))?;
         Ok(())
+    }
+}
+
+fn create_render_target(
+    device: &wgpu::Device,
+    label: &str,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+
+/// Copy a rendered texture into CPU memory, stripping row padding.
+fn read_back_pixels(
+    headless: &Headless,
+    mut command_encoder: wgpu::CommandEncoder,
+    color_texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    // wgpu requires buffer rows padded to 256-byte multiples.
+    let padded_row_byte_count = (width * 4).next_multiple_of(256);
+    let readback_buffer = headless.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("screenshot-readback"),
+        size: (padded_row_byte_count * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    command_encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: color_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row_byte_count),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    headless.queue.submit([command_encoder.finish()]);
+    let buffer_slice = readback_buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    headless
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        })
+        .context("polling GPU")?;
+    receiver
+        .recv()
+        .context("map callback")?
+        .context("mapping readback")?;
+    let mapped_bytes = buffer_slice.get_mapped_range().context("reading pixels")?;
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for row_index in 0..height {
+        let row_start = (row_index * padded_row_byte_count) as usize;
+        pixels.extend_from_slice(&mapped_bytes[row_start..row_start + (width * 4) as usize]);
+    }
+    drop(mapped_bytes);
+    readback_buffer.unmap();
+    Ok(pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_file_names() -> Vec<String> {
+        vec![
+            "Creature\\Ragnaros\\RagnarosHammer.blp".to_string(),
+            "Creature\\Ragnaros\\RagnarosSkin.blp".to_string(),
+            "Creature\\RAGNAROS\\RAGNAROSSKIN.BLP".to_string(),
+            "Creature\\Other\\RagnarosSkin.blp".to_string(),
+            "Creature\\Ragnaros\\Ragnaros.txt".to_string(),
+        ]
+    }
+
+    #[test]
+    fn decode_blp_rejects_invalid_bytes() {
+        assert!(decode_blp_rgba(b"not a blp").is_err());
+        assert!(decode_blp_rgba(b"").is_err());
+    }
+
+    #[test]
+    fn find_skin_fallback_finds_same_directory_skin() {
+        let fallback =
+            find_skin_fallback(&sample_file_names(), "Creature\\Ragnaros\\Ragnaros1.blp")
+                .expect("skin fallback exists");
+        assert!(fallback.to_ascii_lowercase().ends_with("ragnarosskin.blp"));
+        assert!(fallback.starts_with("Creature\\"));
+    }
+
+    #[test]
+    fn find_skin_fallback_prefers_light_skin_variants() {
+        let names = vec![
+            "Creature\\Human\\HumanSkinDark.blp".to_string(),
+            "Creature\\Human\\HumanLightSkin.blp".to_string(),
+        ];
+        let fallback = find_skin_fallback(&names, "Creature\\Human\\Human1.blp").unwrap();
+        assert!(fallback.contains("LightSkin"));
+    }
+
+    #[test]
+    fn find_skin_fallback_returns_none_without_candidates() {
+        assert_eq!(
+            find_skin_fallback(&sample_file_names(), "Creature\\Missing\\Missing1.blp"),
+            None
+        );
+        assert_eq!(
+            find_skin_fallback(&[], "Creature\\Ragnaros\\Ragnaros1.blp"),
+            None
+        );
+        assert_eq!(
+            find_skin_fallback(&sample_file_names(), "NoDirectory1.blp"),
+            None
+        );
     }
 }
